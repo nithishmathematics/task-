@@ -106,6 +106,24 @@ jobs:
           INGRESS_HOST="user.${LB_IP}.nip.io"
           echo "INGRESS_HOST=$INGRESS_HOST" >> $GITHUB_ENV
           echo "Service URL will be: http://$INGRESS_HOST/healthz"
+      - name: Fetch RDS creds and create K8s Secret
+        if: ${{ secrets.AWS_ACCESS_KEY_ID != '' && secrets.AWS_SECRET_ACCESS_KEY != '' }}
+        run: |
+          set -e
+          sudo apt-get update && sudo apt-get install -y jq >/dev/null
+          DB_IDENTIFIER="${DB_INSTANCE_IDENTIFIER:-task-dev-pg}"
+          DB_JSON=$(aws rds describe-db-instances --db-instance-identifier "$DB_IDENTIFIER")
+          DB_ENDPOINT=$(echo "$DB_JSON" | jq -r '.DBInstances[0].Endpoint.Address')
+          DB_NAME=$(echo "$DB_JSON" | jq -r '.DBInstances[0].DBName // "userdb"')
+          DB_USER=$(echo "$DB_JSON" | jq -r '.DBInstances[0].MasterUsername')
+          SECRET_ARN=$(echo "$DB_JSON" | jq -r '.DBInstances[0].MasterUserSecret.SecretArn')
+          if [ -z "$SECRET_ARN" ]; then echo "No MasterUserSecret ARN found on DB instance" >&2; exit 1; fi
+          SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id "$SECRET_ARN" | jq -r '.SecretString')
+          DB_PASS=$(echo "$SECRET_JSON" | jq -r '.password // .Password // .PASS // empty')
+          if [ -z "$DB_PASS" ]; then echo "Password not found in secret string" >&2; exit 1; fi
+          DATABASE_URL="postgres://${DB_USER}:${DB_PASS}@${DB_ENDPOINT}:5432/${DB_NAME}"
+          # Create or update the secret
+          kubectl create secret generic user-service-db --from-literal=url="$DATABASE_URL" -o yaml --dry-run=client | kubectl apply -f -
       - name: Helm install/upgrade user-service
         run: |
           helm upgrade --install user-service k8s/helm/user-service \
@@ -113,9 +131,12 @@ jobs:
             --set image.tag=${{ github.sha }} \
             --set ingress.enabled=true \
             --set ingress.className=nginx \
-            --set ingress.hosts[0].host=${INGRESS_HOST}
+            --set ingress.hosts[0].host=${INGRESS_HOST} \
+            --set database.enabled=true \
+            --set database.existingSecret="user-service-db"
       - name: Output service URL
         run: |
           echo "# Deployment" >> $GITHUB_STEP_SUMMARY
           echo "User service: http://${INGRESS_HOST}/" >> $GITHUB_STEP_SUMMARY
           echo "Healthcheck: http://${INGRESS_HOST}/healthz" >> $GITHUB_STEP_SUMMARY
+          echo "DB Health: http://${INGRESS_HOST}/db-health" >> $GITHUB_STEP_SUMMARY
