@@ -4,8 +4,14 @@ variable "aws_region" {
   default     = "us-east-1"
 }
 
-variable "azure_location" {
-  description = "Azure region"
+variable "db_name" {
+  description = "PostgreSQL database name"
   type        = string
-  default     = "eastus"
+  default     = "userdb"
+}
+
+variable "db_username" {
+  description = "Master username for PostgreSQL"
+  type        = string
+  default     = "appuser"
 }

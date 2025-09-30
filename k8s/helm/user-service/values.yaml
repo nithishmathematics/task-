@@ -6,6 +6,13 @@ image:
   tag: latest
   pullPolicy: IfNotPresent
 
+database:
+  enabled: false
+  # If you already created a Secret with key 'url', put its name here
+  existingSecret: ""
+  # If no existingSecret, set url and the chart will create a Secret 'user-service-db'
+  url: ""
+
 service:
   type: ClusterIP
   port: 80
