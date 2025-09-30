@@ -33,8 +33,74 @@ jobs:
       - uses: actions/checkout@v4
       - name: Setup kubectl
         uses: azure/setup-kubectl@v4
+      - name: Azure login (if provided)
+        if: ${{ secrets.AZURE_CREDENTIALS != '' }}
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Set AKS context (if Azure provided)
+        if: ${{ secrets.AZURE_CREDENTIALS != '' && secrets.AKS_RESOURCE_GROUP != '' && secrets.AKS_CLUSTER_NAME != '' }}
+        uses: azure/aks-set-context@v3
+        with:
+          resource-group: ${{ secrets.AKS_RESOURCE_GROUP }}
+          cluster-name: ${{ secrets.AKS_CLUSTER_NAME }}
+      - name: Load kubeconfig from secret (if provided)
+        if: ${{ secrets.AZURE_CREDENTIALS == '' && secrets.KUBECONFIG_B64 != '' }}
+        run: |
+          echo "${KUBECONFIG_B64}" | base64 -d > kubeconfig
+          echo "KUBECONFIG=$PWD/kubeconfig" >> $GITHUB_ENV
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+      - name: Ensure ingress-nginx
+        run: |
+          set -e
+          if ! kubectl get ns ingress-nginx >/dev/null 2>&1; then
+            helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+            helm repo update
+            helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+              --namespace ingress-nginx --create-namespace
+          fi
+      - name: Wait for ingress external IP/hostname
+        run: |
+          set -e
+          for i in {1..30}; do
+            HOSTNAME=$(kubectl get svc -n ingress-nginx ingress-nginx-controller -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+            IP=$(kubectl get svc -n ingress-nginx ingress-nginx-controller -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+            if [ -n "$IP" ]; then echo "Found ingress IP: $IP"; break; fi
+            if [ -n "$HOSTNAME" ]; then echo "Found ingress hostname: $HOSTNAME"; break; fi
+            echo "Waiting for ingress LoadBalancer... ($i)"; sleep 10;
+          done
+          echo "LB_HOSTNAME=$HOSTNAME" >> $GITHUB_ENV
+          echo "LB_IP=$IP" >> $GITHUB_ENV
+      - name: Resolve IP from hostname (if needed)
+        run: |
+          set -e
+          if [ -z "$LB_IP" ] && [ -n "$LB_HOSTNAME" ]; then
+            sudo apt-get update && sudo apt-get install -y dnsutils >/dev/null
+            RESOLVED_IP=$(nslookup "$LB_HOSTNAME" | awk '/Address: /{print $2; exit}')
+            echo "Resolved $LB_HOSTNAME to $RESOLVED_IP"
+            echo "LB_IP=$RESOLVED_IP" >> $GITHUB_ENV
+          fi
+      - name: Compute nip.io host
+        run: |
+          set -e
+          if [ -z "$LB_IP" ]; then
+            echo "Ingress IP not available; cannot compute nip.io hostname" >&2
+            exit 1
+          fi
+          INGRESS_HOST="user.${LB_IP}.nip.io"
+          echo "INGRESS_HOST=$INGRESS_HOST" >> $GITHUB_ENV
+          echo "Service URL will be: http://$INGRESS_HOST/healthz"
       - name: Helm install/upgrade user-service
         run: |
           helm upgrade --install user-service k8s/helm/user-service \
             --set image.repository=ghcr.io/${{ github.repository_owner }}/user-service \
-            --set image.tag=${{ github.sha }}
+            --set image.tag=${{ github.sha }} \
+            --set ingress.enabled=true \
+            --set ingress.className=nginx \
+            --set ingress.hosts[0].host=${INGRESS_HOST}
+      - name: Output service URL
+        run: |
+          echo "# Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "User service: http://${INGRESS_HOST}/" >> $GITHUB_STEP_SUMMARY
+          echo "Healthcheck: http://${INGRESS_HOST}/healthz" >> $GITHUB_STEP_SUMMARY
